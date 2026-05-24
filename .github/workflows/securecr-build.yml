@@ -7,17 +7,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.75"
-  FLUTTER_VERSION: "3.24.5"
+  SCITER_RUST_VERSION: "1.75"
   LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
-  RUSTDESK_FEATURES: "inline,vram,hwcodec,flutter,flutter_texture_render,unix-file-copy-paste"
+  VCPKG_TRIPLET: x64-windows-static
 
 jobs:
   build-windows:
     name: Build SecureCR Windows x86_64
     runs-on: windows-2022
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
@@ -30,17 +30,37 @@ jobs:
           version: ${{ env.LLVM_VERSION }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: ${{ env.RUST_VERSION }}
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
           targets: x86_64-pc-windows-msvc
+          components: rustfmt
 
-      - name: Cache Rust target/
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: securecr-rust-win
-          shared-key: build
-          workspaces: ". -> target"
+          prefix-key: securecr-windows-2022
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies (manifest mode)
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+        shell: bash
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet ${{ env.VCPKG_TRIPLET }} \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r f; do
+              echo "$f:"; echo "======"; cat "$f"; echo "======"
+            done
+            exit 1
+          fi
 
       - name: Install Flutter
         uses: subosito/flutter-action@v2
@@ -48,27 +68,10 @@ jobs:
           channel: stable
           flutter-version: ${{ env.FLUTTER_VERSION }}
 
-      - name: Install vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
-
-      - name: Install vcpkg dependencies
-        shell: bash
-        run: |
-          $VCPKG_ROOT/vcpkg install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static aom:x64-windows-static
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Fetch IDD driver (for Privacy Mode)
-        shell: pwsh
-        run: |
-          $url = "https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip"
-          Invoke-WebRequest -Uri $url -OutFile usbmmidd_v2.zip
-          Expand-Archive -Path usbmmidd_v2.zip -DestinationPath . -Force
 
       - name: Patch version + rotate ed25519/relay in hbb_common
         shell: bash
@@ -77,52 +80,41 @@ jobs:
           VERSION="0.1.0-alpha+${GITHUB_RUN_NUMBER}"
           echo "Building SecureCR ${VERSION}"
           echo "SECURECR_VERSION=${VERSION}" >> $GITHUB_ENV
-
-          # Rotate keys + endpoints in the hbb_common submodule (we keep the
-          # submodule pinned to upstream and inject our values at build time).
           CONFIG="libs/hbb_common/src/config.rs"
           sed -i 's|RENDEZVOUS_SERVERS: &\[&str\] = &\["rs-ny.rustdesk.com"\]|RENDEZVOUS_SERVERS: \&[\&str] = \&["relay.prvdropshipping.com"]|' "$CONFIG"
           sed -i 's|RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="|RS_PUB_KEY: \&str = "1HIrAIdfBB26nRhzt9CVXX21St0jjpEyAYNQws1+ZDo="|' "$CONFIG"
           echo "Verifying patched config.rs:"
           grep -E "RS_PUB_KEY|RENDEZVOUS_SERVERS" "$CONFIG" | head -2
 
-      - name: Build Rust libs (flutter features)
-        shell: bash
-        env:
-          VCPKG_ROOT: ${{ runner.workspace }}/vcpkg
-        run: |
-          cargo build --lib --release --features "${RUSTDESK_FEATURES}" --target x86_64-pc-windows-msvc
-          # Copy DLL to expected path
-          mkdir -p target/release
-          cp target/x86_64-pc-windows-msvc/release/librustdesk.dll target/release/ 2>/dev/null || true
-
-      - name: Build Flutter Windows release
-        shell: bash
-        working-directory: flutter
-        run: |
-          flutter config --enable-windows-desktop
-          flutter pub get
-          flutter build windows --release
-
-      - name: Stage SecureCR portable
+      - name: Build SecureCR (via upstream build.py)
         shell: pwsh
         run: |
-          $stage = "SecureCR-portable"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          $built = "flutter\build\windows\x64\runner\Release"
-          if (-Not (Test-Path $built)) {
-            $built = "flutter\build\windows\runner\Release"
+          python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
+          mv ./flutter/build/windows/x64/runner/Release ./securecr
+
+      - name: Fetch IDD driver for Privacy Mode
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse -ErrorAction SilentlyContinue
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe","usbmmidd_v2\deviceinstaller.exe","usbmmidd_v2\usbmmidd.bat" -ErrorAction SilentlyContinue
+          mv -Force .\usbmmidd_v2 ./securecr
+
+      - name: Rename binary to SecureCR.exe
+        shell: pwsh
+        run: |
+          if (Test-Path "./securecr/rustdesk.exe") {
+            Rename-Item -Path "./securecr/rustdesk.exe" -NewName "SecureCR.exe"
           }
-          Copy-Item -Path "$built\*" -Destination $stage -Recurse -Force
-          if (Test-Path "usbmmidd_v2") {
-            Copy-Item -Path "usbmmidd_v2" -Destination "$stage\usbmmidd_v2" -Recurse -Force
-          }
-          # Rename binary
-          if (Test-Path "$stage\rustdesk.exe") {
-            Rename-Item -Path "$stage\rustdesk.exe" -NewName "SecureCR.exe"
-          }
-          Compress-Archive -Path "$stage\*" -DestinationPath "SecureCR-${env:SECURECR_VERSION}-windows-x86_64.zip" -Force
-          Get-ChildItem "SecureCR-*.zip" | Select-Object Name,Length
+          Get-ChildItem ./securecr | Select-Object Name,Length | Format-Table
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $zip = "SecureCR-${env:SECURECR_VERSION}-windows-x86_64.zip"
+          Compress-Archive -Path "./securecr/*" -DestinationPath $zip -Force
+          Get-Item $zip | Select-Object Name,Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -131,7 +123,7 @@ jobs:
           path: SecureCR-*.zip
           retention-days: 30
 
-      - name: Create or update GitHub Release (alpha channel)
+      - name: Create/Update GitHub Release (alpha channel)
         if: github.ref == 'refs/heads/securecr'
         uses: softprops/action-gh-release@v2
         with:
