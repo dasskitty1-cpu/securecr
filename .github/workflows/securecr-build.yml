@@ -12,6 +12,8 @@ env:
   FLUTTER_VERSION: "3.24.5"
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
   VCPKG_TRIPLET: x64-windows-static
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  CARGO_EXPAND_VERSION: "1.0.95"
 
 jobs:
   build-windows:
@@ -85,6 +87,36 @@ jobs:
           sed -i 's|RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="|RS_PUB_KEY: \&str = "1HIrAIdfBB26nRhzt9CVXX21St0jjpEyAYNQws1+ZDo="|' "$CONFIG"
           echo "Verifying patched config.rs:"
           grep -E "RS_PUB_KEY|RENDEZVOUS_SERVERS" "$CONFIG" | head -2
+
+      - name: Cache flutter_rust_bridge_codegen
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/flutter_rust_bridge_codegen.exe
+            ~/.cargo/bin/cargo-expand.exe
+          key: frb-${{ env.FLUTTER_RUST_BRIDGE_VERSION }}-cexp-${{ env.CARGO_EXPAND_VERSION }}-win
+
+      - name: Install flutter_rust_bridge_codegen (if not cached)
+        shell: bash
+        run: |
+          if [ ! -f "$HOME/.cargo/bin/flutter_rust_bridge_codegen.exe" ]; then
+            cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+            cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+          else
+            echo "Using cached binaries."
+          fi
+
+      - name: Generate Flutter-Rust bridge
+        shell: bash
+        run: |
+          set -e
+          ~/.cargo/bin/flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          # The Windows DartPort fix-up from upstream build.py
+          sed -i 's/ffi.NativeFunction<ffi.Bool Function(DartPort/ffi.NativeFunction<ffi.Uint8 Function(DartPort/g' flutter/lib/generated_bridge.dart
+          ls -la src/bridge_generated*.rs 2>&1 | head -5
 
       - name: Build SecureCR (via upstream build.py)
         shell: pwsh
