@@ -89,7 +89,7 @@ jobs:
       - name: Build SecureCR (via upstream build.py)
         shell: pwsh
         run: |
-          python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
+          python3 .\build.py --portable --hwcodec --flutter --skip-portable-pack
           mv ./flutter/build/windows/x64/runner/Release ./securecr
 
       - name: Fetch IDD driver for Privacy Mode
